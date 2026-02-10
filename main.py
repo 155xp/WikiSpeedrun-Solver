@@ -1,23 +1,29 @@
 import requests
 import re
 import time
-import os
 from concurrent.futures import ThreadPoolExecutor
 from sentence_transformers import SentenceTransformer, util
 import numpy as np
+from bs4 import BeautifulSoup
+import torch
 
 START_URL = "https://en.wikipedia.org/wiki/GitHub"
-END_URL = "https://en.wikipedia.org/wiki/YouTube"
+END_URL = "https://en.wikipedia.org/wiki/Warsaw"
+MAX_LINKS_PER_PAGE = 150
+ENCODE_BATCH_SIZE = 128
+STEP_DELAY_SECONDS = 0.2
 
 # setup
-model = SentenceTransformer("BAAI/bge-small-en-v1.5") 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = SentenceTransformer("BAAI/bge-small-en-v1.5", device=device)
 session = requests.Session()
 session.headers["User-Agent"] = "Mozilla/5.0"
-executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 8)
+executor = ThreadPoolExecutor(max_workers=4)
 
 # caches
 cache = {}
 pending = {}
+embedding_cache = {}
 
 
 def fetch(page):
@@ -76,27 +82,45 @@ def extract_links(html):
     # pages to skip
     skip = ('File:', 'Wikipedia:', 'Help:', 'Special:', 'Talk:', 
             'Template:', 'Category:', 'Portal:', 'Main_Page')
-    
-    # remove script and style tags
-    html = re.sub(r'<script.*?</script>', '', html, flags=re.DOTALL)
-    html = re.sub(r'<style.*?</style>', '', html, flags=re.DOTALL)
-    
-    # find all wiki links
-    pattern = r'(.{0,150})<a[^>]*href="/wiki/([^"#:]+)"[^>]*>([^<]+)</a>(.{0,150})'
-    matches = re.findall(pattern, html, re.DOTALL)
-    
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
     links = {}
-    for before, link, text, after in matches:
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("/wiki/"):
+            continue
+        link = href[len("/wiki/"):]
+
         # skip bad links
         if link.startswith(skip):
             continue
+        if ":" in link or "#" in link:
+            continue
         if link in links:
             continue
-        
-        # get context around link
-        context = before + text + after
-        context = re.sub(r'<[^>]+>', ' ', context)  # remove html tags
-        context = re.sub(r'\s+', ' ', context)      # fix whitespace
+
+        text = a.get_text(" ", strip=True)
+        parent_text = a.parent.get_text(" ", strip=True) if a.parent else text
+        if not parent_text:
+            continue
+
+        context = parent_text
+        if len(context) > 320:
+            if text:
+                idx = context.lower().find(text.lower())
+            else:
+                idx = -1
+            if idx >= 0:
+                start = max(0, idx - 120)
+                end = min(len(context), idx + len(text) + 120)
+                context = context[start:end]
+            else:
+                context = context[:240]
+
+        context = re.sub(r"\s+", " ", context)
         links[link] = context.strip()
     
     return links
@@ -105,9 +129,18 @@ def extract_links(html):
 def find_closest(links, target_embed, top_n=5):
     keys = list(links.keys())
     contexts = list(links.values())
-    
-    # encode all contexts
-    embeds = model.encode(contexts, show_progress_bar=False, batch_size=64)
+
+    # encode only uncached contexts
+    uncached = [c for c in contexts if c not in embedding_cache]
+    if uncached:
+        new_embeds = model.encode(
+            uncached,
+            show_progress_bar=False,
+            batch_size=ENCODE_BATCH_SIZE,
+        )
+        for c, e in zip(uncached, new_embeds):
+            embedding_cache[c] = e
+    embeds = np.vstack([embedding_cache[c] for c in contexts])
     
     # compare to target
     scores = util.cos_sim(embeds, target_embed)
@@ -166,6 +199,10 @@ if __name__ == "__main__":
         for k, v in all_links.items():
             if k not in visited:
                 links[k] = v
+
+        # keep only the first N links to speed up each step
+        if len(links) > MAX_LINKS_PER_PAGE:
+            links = dict(list(links.items())[:MAX_LINKS_PER_PAGE])
         
         # dead end check
         if not links:
@@ -197,6 +234,7 @@ if __name__ == "__main__":
         # print progress
         elapsed = time.time() - step_time
         print(f"-> {clean(closest)} (score: {score:.3f}) [{elapsed:.2f}s]")
+        time.sleep(STEP_DELAY_SECONDS)
     
     # done
     total_time = time.time() - start_time
