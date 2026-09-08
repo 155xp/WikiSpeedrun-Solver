@@ -1,223 +1,126 @@
-import requests
-import re
+import sys
 import time
-import os
-from concurrent.futures import ThreadPoolExecutor
-from sentence_transformers import SentenceTransformer, util
-import numpy as np
+from html.parser import HTMLParser
+from urllib.parse import quote, unquote, urljoin, urlsplit
+
+import requests
 
 START_URL = "https://en.wikipedia.org/wiki/GitHub"
 END_URL = "https://en.wikipedia.org/wiki/Warsaw"
+BASE_URL = "https://en.wikipedia.org/wiki/"
 
-MAX_LINKS_SCAN = 140
-TOP_N = 8
-BATCH_SIZE = 64
-PREFETCH_N = 8
-
-model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+# reuse the connection for each page
 session = requests.Session()
-session.headers["User-Agent"] = "Mozilla/5.0"
-executor = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 8))
+session.headers["User-Agent"] = "WikiSpeedrun-Solver/1.0 (https://github.com/155xp/WikiSpeedrun-Solver)"
 
-cache = {}
-pending = {}
-embedding_cache = {}
-
-SKIP = (
-    "File:", "Wikipedia:", "Help:", "Special:", "Talk:",
-    "Template:", "Category:", "Portal:", "Main_Page"
-)
-
-LINK_PATTERN = re.compile(
-    r'<a[^>]*href="/wiki/([^"#:]+)"[^>]*>(.*?)</a>',
-    re.DOTALL | re.IGNORECASE
-)
-TAG_RE = re.compile(r"<[^>]+>")
-SPACE_RE = re.compile(r"\s+")
+# these pages are not game articles
+SKIP = ("File:", "Image:", "Wikipedia:", "Help:", "Special:", "Talk:",
+        "Template:", "Category:", "Portal:", "Draft:", "Module:", "MediaWiki:",
+        "User:", "Media:")
 
 
-def clean(text):
-    return re.sub(r"[_%27]+", " ", text)
+def page_name(value):
+    # accept an article title or an english wikipedia url
+    value = value.strip()
+    if value.startswith(('https://', 'http://')):
+        url = urlsplit(value)
+        if url.hostname != 'en.wikipedia.org' or not url.path.startswith('/wiki/'):
+            raise ValueError('use an english wikipedia article url')
+        value = url.path[6:]
+    value = unquote(value).replace(' ', '_')
+    if not value:
+        raise ValueError('article title cannot be empty')
+    return value[0].upper() + value[1:]
 
 
-def get_page(url):
-    return url[url.find("/wiki/") + 6:]
+def page_url(page):
+    # keep punctuation in titles from changing the url
+    return BASE_URL + quote(page, safe='/:')
 
 
-def fetch(page):
-    url = "https://en.wikipedia.org/wiki/" + page
-    try:
-        r = session.get(url, timeout=8)
-        if r.ok:
-            return page, r.text
-    except:
-        pass
-    return page, ""
+class ArticleLinks(HTMLParser):
+    def __init__(self, page):
+        super().__init__()
+        self.url = page_url(page)
+        self.links = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag != 'a':
+            return
+        href = dict(attrs).get('href') or ''
+        # resolve both ./article and /wiki/article links
+        url = urlsplit(urljoin(self.url, href))
+        if not href or href.startswith('#') or url.hostname != 'en.wikipedia.org':
+            return
+        if not url.path.startswith('/wiki/') or url.path == '/wiki/' or url.query:
+            return
+        title = page_name(url.path[6:])
+        # filter site pages after decoding escaped names
+        if title == 'Main_Page' or title.startswith(SKIP) or '_talk:' in title:
+            return
+        self.links[title] = title.replace('_', ' ')
 
 
-def get_html(page):
-    done_pages = []
-    for p, future in pending.items():
-        if future.done():
-            done_pages.append(p)
-
-    for p in done_pages:
-        future = pending.pop(p)
-        try:
-            result = future.result()
-            cache[p] = result[1]
-        except:
-            cache[p] = ""
-
-    if page in cache:
-        return cache[page]
-
-    if page in pending:
-        future = pending.pop(page)
-        try:
-            result = future.result(timeout=15)
-            cache[page] = result[1]
-            return result[1]
-        except:
-            return ""
-
-    result = fetch(page)
-    cache[page] = result[1]
-    return result[1]
+def extract_links(html, page):
+    parser = ArticleLinks(page)
+    parser.feed(html)
+    return parser.links
 
 
-def prefetch(pages):
-    for p in pages:
-        if p not in cache and p not in pending:
-            pending[p] = executor.submit(fetch, p)
+def get_links(page):
+    response = session.get(page_url(page), timeout=15)
+    # show request failures instead of calling them dead ends
+    response.raise_for_status()
+    return extract_links(response.text, page)
 
 
-def strip_tags(text):
-    text = TAG_RE.sub(" ", text)
-    text = SPACE_RE.sub(" ", text)
-    return text.strip()
-
-
-def extract_links_fast(html):
-    links = {}
-    count = 0
-
-    for match in LINK_PATTERN.finditer(html):
-        link = match.group(1)
-        raw_text = match.group(2)
-
-        if not link or link.startswith(SKIP):
-            continue
-        if link in links:
-            continue
-
-        anchor = strip_tags(raw_text)
-        title = clean(link)
-
-        # shorter context than before: just title + anchor
-        if anchor and anchor.lower() != title.lower():
-            context = f"{title} | {anchor}"
-        else:
-            context = title
-
-        links[link] = context[:100]
-
-        count += 1
-        if count >= MAX_LINKS_SCAN:
-            break
-
-    return links
-
-
-def find_closest(links, target_embed, top_n=TOP_N):
-    keys = list(links.keys())
-    contexts = list(links.values())
-
-    uncached = [c for c in contexts if c not in embedding_cache]
-    if uncached:
-        embeds = model.encode(
-            uncached,
-            show_progress_bar=False,
-            batch_size=BATCH_SIZE
-        )
-        for c, e in zip(uncached, embeds):
-            embedding_cache[c] = e
-
-    all_embeds = np.vstack([embedding_cache[c] for c in contexts])
-    scores = util.cos_sim(all_embeds, target_embed).squeeze()
-
-    if hasattr(scores, "cpu"):
-        scores = scores.cpu().numpy()
-
-    if np.ndim(scores) == 0:
-        return keys[0], float(scores), keys[:top_n]
-
-    k = min(top_n, len(scores))
-    top_idx = np.argpartition(scores, -k)[-k:]
-    top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
-
-    best = top_idx[0]
-    top_links = [keys[i] for i in top_idx]
-
-    return keys[best], float(scores[best]), top_links
-
-
-if __name__ == "__main__":
-    start = get_page(START_URL)
-    end = get_page(END_URL)
-
-    current = start
+def solve(start, end, model, max_steps=50):
     path = [start]
-    visited = {start}
-
-    target_embed = model.encode(clean(end))
-
-    print(f"Starting: {clean(start)}")
-    print(f"Target: {clean(end)}\n")
-
-    start_time = time.time()
-
-    while current != end:
-        step_time = time.time()
-
-        html = get_html(current)
-        all_links = extract_links_fast(html)
-
-        links = {}
-        for k, v in all_links.items():
-            if k not in visited:
-                links[k] = v
-
-        if not links:
-            print("dead end")
-            break
-
+    target = model.encode([end.replace('_', ' ')], normalize_embeddings=True)[0]
+    for _ in range(max_steps):
+        if path[-1] == end:
+            return path
+        # read the whole page and never revisit an article
+        links = {k: v for k, v in get_links(path[-1]).items() if k not in path}
         if end in links:
-            path.append(end)
-            elapsed = time.time() - step_time
-            print(f"-> {clean(end)} (FOUND) [{elapsed:.2f}s]")
-            break
+            print(f'-> {end.replace("_", " ")} (FOUND)', flush=True)
+            return path + [end]
+        if not links:
+            raise RuntimeError(f'dead end at {path[-1]}: no unvisited article links')
+        vectors = model.encode(list(links.values()), normalize_embeddings=True,
+                               batch_size=64, show_progress_bar=False)
+        # normalized vectors let a dot product measure similarity
+        scores = [sum(a * b for a, b in zip(vector, target)) for vector in vectors]
+        best = max(range(len(scores)), key=scores.__getitem__)
+        page = list(links)[best]
+        path.append(page)
+        print(f'-> {page.replace("_", " ")} (score: {scores[best]:.3f})', flush=True)
+    # ponytail: greedy search can miss a route; use graph search if that matters
+    raise RuntimeError(f'step limit reached ({max_steps}) without finding {end}')
 
-        closest, score, top = find_closest(links, target_embed, top_n=TOP_N)
 
-        prefetch([c for c in top[:PREFETCH_N] if c not in visited])
+def main():
+    # load the model only when running a search
+    from sentence_transformers import SentenceTransformer
 
-        visited.add(closest)
-        path.append(closest)
-        current = closest
+    try:
+        if len(sys.argv) not in (1, 3):
+            raise ValueError('usage: python main.py [start_article target_article]')
+        start, end = map(page_name, sys.argv[1:] or [START_URL, END_URL])
+        print(f'Starting: {start.replace("_", " ")}\nTarget: {end.replace("_", " ")}', flush=True)
+        model = SentenceTransformer('BAAI/bge-small-en-v1.5')
+        started = time.monotonic()
+        path = solve(start, end, model)
+        print(f'\nTime: {time.monotonic() - started:.2f}s | Steps: {len(path) - 1}')
+        print('\nPath taken:')
+        for page in path:
+            print(f'  {page_url(page)}')
+    except (requests.RequestException, ValueError, RuntimeError) as error:
+        # failed runs should also report failure to the shell
+        print(f'Error: {error}', file=sys.stderr)
+        return 1
+    return 0
 
-        elapsed = time.time() - step_time
-        print(f"-> {clean(closest)} (score: {score:.3f}) [{elapsed:.2f}s]")
 
-    total_time = time.time() - start_time
-    steps = len(path) - 1
-
-    print(f"\n{'='*60}")
-    print(f"Time: {total_time:.2f}s | Steps: {steps}")
-    print(f"{'='*60}")
-
-    print("\nPath taken:")
-    for p in path:
-        print(f"  https://en.wikipedia.org/wiki/{p}")
-
-    executor.shutdown(wait=False)
+if __name__ == '__main__':
+    sys.exit(main())
